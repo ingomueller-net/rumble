@@ -37,12 +37,14 @@ import org.rumbledb.exceptions.IteratorFlowException;
 import org.rumbledb.exceptions.JobWithinAJobException;
 import org.rumbledb.expressions.ExecutionMode;
 import org.rumbledb.items.ItemFactory;
+import org.rumbledb.runtime.operational.ComparisonOperationIterator;
 import org.rumbledb.runtime.RuntimeIterator;
 import org.rumbledb.runtime.RuntimeTupleIterator;
 import org.rumbledb.runtime.flwor.FlworDataFrameUtils;
 import org.rumbledb.runtime.flwor.closures.ItemsToBinaryColumn;
 import org.rumbledb.runtime.flwor.udfs.DataFrameContext;
 import org.rumbledb.runtime.flwor.udfs.ForClauseUDF;
+import org.rumbledb.runtime.flwor.udfs.LetClauseUDF;
 import org.rumbledb.runtime.flwor.udfs.IntegerSerializeUDF;
 import org.rumbledb.runtime.flwor.udfs.WhereClauseUDF;
 import org.rumbledb.runtime.postfix.PredicateIterator;
@@ -53,6 +55,7 @@ import sparksoniq.spark.SparkSessionManager;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -466,64 +469,105 @@ public class ForClauseSparkIterator extends RuntimeTupleIterator {
         String projectionVariables = FlworDataFrameUtils.getListOfSQLVariables(columnsToSelect, true);
 
         // We need to prepare the parameters fed into the predicate.
-        Map<String, List<String>> UDFcolumnsByType = FlworDataFrameUtils.getColumnNamesByType(
+        // Parameters from left side
+        Map<String, List<String>> leftUDFcolumnsByType = FlworDataFrameUtils.getColumnNamesByType(
             inputSchema,
             -1,
             predicateDependencies
         );
-        if (!UDFcolumnsByType.containsKey("byte[]")) {
-            UDFcolumnsByType.put("byte[]", new ArrayList<>());
-        }
+
+        // Parameters from right side
+        Map<String, List<String>> rightUDFcolumnsByType = new HashMap<>();
+        rightUDFcolumnsByType.put("Long", new ArrayList<>());
+        rightUDFcolumnsByType.put("byte[]", new ArrayList<>());
         if (predicateDependencies.containsKey(Name.CONTEXT_ITEM)) {
-            UDFcolumnsByType.get("byte[]").add(Name.CONTEXT_ITEM.getLocalName());
+            rightUDFcolumnsByType.get("byte[]").add(Name.CONTEXT_ITEM.getLocalName());
         }
         if (predicateDependencies.containsKey(Name.CONTEXT_POSITION)) {
-            UDFcolumnsByType.get("byte[]").add(Name.CONTEXT_POSITION.getLocalName());
+            rightUDFcolumnsByType.get("byte[]").add(Name.CONTEXT_POSITION.getLocalName());
         }
         if (predicateDependencies.containsKey(Name.CONTEXT_COUNT)) {
-            UDFcolumnsByType.get("byte[]").add(Name.CONTEXT_COUNT.getLocalName());
+            rightUDFcolumnsByType.get("byte[]").add(Name.CONTEXT_COUNT.getLocalName());
         }
 
-        // Now we need to register or join predicate as a UDF.
-        inputDF.sparkSession()
-            .udf()
-            .register(
-                "joinUDF",
-                new WhereClauseUDF(predicateIterator, context, UDFcolumnsByType),
-                DataTypes.BooleanType
-            );
+        // Parameters from both sides
+        Map<String, List<String>> UDFcolumnsByType = new HashMap<>();
+        UDFcolumnsByType.put("Long", new ArrayList<>());
+        UDFcolumnsByType.put("byte[]", new ArrayList<>());
+        leftUDFcolumnsByType.forEach((type, dependencies) -> UDFcolumnsByType.get(type).addAll(dependencies));
+        rightUDFcolumnsByType.forEach((type, dependencies) -> UDFcolumnsByType.get(type).addAll(dependencies));
 
-        String UDFParameters = FlworDataFrameUtils.getUDFParameters(UDFcolumnsByType);
+        String joinCondition;
+        if (predicateIterator instanceof ComparisonOperationIterator) {
+            // Special case of equi-join
+            ComparisonOperationIterator comp = (ComparisonOperationIterator) predicateIterator;
 
-        // If we allow empty, we need a LEFT OUTER JOIN.
-        if (this.allowingEmpty) {
-            Dataset<Row> resultDF = inputDF.sparkSession()
-                .sql(
-                    String.format(
-                        "SELECT %s `%s`.`%s` AS `%s` FROM %s LEFT OUTER JOIN %s ON joinUDF(%s) = 'true'",
-                        projectionVariables,
-                        expressionDFTableName,
-                        Name.CONTEXT_ITEM.getLocalName(),
-                        this.variableName,
-                        inputDFTableName,
-                        expressionDFTableName,
-                        UDFParameters
-                    )
+            // UDF to compute left join key
+            inputDF.sparkSession()
+                .udf()
+                .register(
+                    "leftSideUDF",
+                    new LetClauseUDF(comp.leftIterator, context, leftUDFcolumnsByType),
+                    DataTypes.BinaryType
                 );
-            return resultDF;
+
+            // UDF to compute right join key
+            inputDF.sparkSession()
+                .udf()
+                .register(
+                    "rightSideUDF",
+                    new LetClauseUDF(comp.rightIterator, context, UDFcolumnsByType),
+                    DataTypes.BinaryType
+                );
+
+            String leftUDFParameters = FlworDataFrameUtils.getUDFParameters(leftUDFcolumnsByType);
+            String rightUDFParameters = FlworDataFrameUtils.getUDFParameters(rightUDFcolumnsByType);
+
+            joinCondition = String.format(
+                    "leftSideUDF(%s) = rightSideUDF(%s)",
+                    leftUDFParameters, rightUDFParameters
+                );
+        } else {
+            // Fall back to theta join
+
+            // Register or join predicate as a UDF.
+            inputDF.sparkSession()
+                .udf()
+                .register(
+                    "joinUDF",
+                    new WhereClauseUDF(predicateIterator, context, UDFcolumnsByType),
+                    DataTypes.BooleanType
+                );
+
+            String UDFParameters = FlworDataFrameUtils.getUDFParameters(UDFcolumnsByType);
+
+            joinCondition = String.format(
+                    "joinUDF(%s) = 'true'",
+                    UDFParameters
+                );
         }
-        // Otherwise, it's a regular join.
+
+        String joinKeywords;
+        if (this.allowingEmpty) {
+            // If we allow empty, we need a LEFT OUTER JOIN.
+            joinKeywords = "LEFT OUTER JOIN";
+        } else {
+            // Otherwise, it's a regular join.
+            joinKeywords = "JOIN";
+        }
+
         Dataset<Row> resultDF = inputDF.sparkSession()
             .sql(
                 String.format(
-                    "SELECT %s `%s`.`%s` AS `%s` FROM %s JOIN %s ON joinUDF(%s) = 'true'",
+                    "SELECT %s `%s`.`%s` AS `%s` FROM %s %s %s ON %s",
                     projectionVariables,
                     expressionDFTableName,
                     Name.CONTEXT_ITEM.getLocalName(),
                     this.variableName,
                     inputDFTableName,
+                    joinKeywords,
                     expressionDFTableName,
-                    UDFParameters
+                    joinCondition
                 )
             );
         return resultDF;

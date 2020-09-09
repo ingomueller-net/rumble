@@ -42,9 +42,9 @@ public class ComparisonOperationIterator extends LocalRuntimeIterator {
     private static final long serialVersionUID = 1L;
     private Item left;
     private Item right;
-    private ComparisonExpression.ComparisonOperator comparisonOperator;
-    private RuntimeIterator leftIterator;
-    private RuntimeIterator rightIterator;
+    public ComparisonExpression.ComparisonOperator comparisonOperator;
+    public RuntimeIterator leftIterator;
+    public RuntimeIterator rightIterator;
 
 
     public ComparisonOperationIterator(
